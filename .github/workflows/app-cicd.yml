@@ -1,0 +1,163 @@
+# =============================================================================
+# Application pipeline
+#   1. test          → npm ci + unit tests
+#   2. lint-docker   → hadolint checks YOUR Dockerfile
+#   3. build-push    → docker build, Trivy scan, push to ECR (main only)
+#   4. deploy        → kubectl apply to EKS + rollout check + smoke test (main only)
+# =============================================================================
+name: App CI/CD
+
+on:
+  pull_request:
+    paths: ["app/**", "k8s/**", ".github/workflows/app-cicd.yml"]
+  push:
+    branches: [main]
+    paths: ["app/**", "k8s/**", ".github/workflows/app-cicd.yml"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for AWS OIDC
+  contents: read
+
+concurrency:
+  group: app-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}     # e.g. capstone-dev-task-api
+  EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }} # e.g. capstone-dev
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  lint-docker:
+    name: Lint Dockerfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: app/Dockerfile
+          failure-threshold: warning
+
+  build-push:
+    name: Build, scan & push image
+    needs: [test, lint-docker]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image name
+        id: meta
+        run: echo "image=${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        run: docker build -t "${{ steps.meta.outputs.image }}" app/
+
+      - name: Smoke-test the container locally
+        run: |
+          docker run -d --name smoke -p 3000:3000 "${{ steps.meta.outputs.image }}"
+          for i in $(seq 1 15); do
+            curl -fsS http://localhost:3000/healthz && exit 0
+            sleep 2
+          done
+          echo "Container did not become healthy"; docker logs smoke; exit 1
+
+      - name: Check image runs as non-root
+        run: |
+          user=$(docker inspect --format '{{.Config.User}}' "${{ steps.meta.outputs.image }}")
+          echo "Image user: '${user}'"
+          if [ -z "$user" ] || [ "$user" = "root" ] || [ "$user" = "0" ]; then
+            echo "::error::Image must not run as root (set USER in the Dockerfile)"; exit 1
+          fi
+
+      - name: Scan image with Trivy (fail on CRITICAL)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image \
+            --severity CRITICAL --ignore-unfixed --exit-code 1 --no-progress \
+            "${{ steps.meta.outputs.image }}"
+
+      - name: Push image
+        run: docker push "${{ steps.meta.outputs.image }}"
+
+  deploy:
+    name: Deploy to EKS
+    needs: build-push
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: azure/setup-kubectl@v4
+
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+
+      - name: Render manifests
+        run: |
+          sed -i "s|IMAGE_PLACEHOLDER|${{ needs.build-push.outputs.image }}|" k8s/02-deployment.yaml
+          sed -i "s|VERSION_PLACEHOLDER|\"${IMAGE_TAG::7}\"|" k8s/02-deployment.yaml
+          grep -n "image:" k8s/02-deployment.yaml
+
+      - name: Apply manifests
+        run: kubectl apply -f k8s/
+
+      - name: Wait for rollout (auto-rollback on failure)
+        run: |
+          if ! kubectl rollout status deployment/task-api -n task-api --timeout=180s; then
+            echo "::error::Rollout failed — rolling back"
+            kubectl describe pods -n task-api -l app=task-api | tail -50
+            kubectl rollout undo deployment/task-api -n task-api
+            exit 1
+          fi
+
+      - name: Smoke test through the load balancer
+        run: |
+          for i in $(seq 1 30); do
+            host=$(kubectl get svc task-api -n task-api -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            if [ -n "$host" ] && curl -fsS "http://$host/healthz"; then
+              echo
+              echo "### 🚀 Deployed: http://$host" >> "$GITHUB_STEP_SUMMARY"
+              curl -fsS "http://$host/"
+              exit 0
+            fi
+            echo "Waiting for load balancer DNS... ($i/30)"; sleep 10
+          done
+          echo "::warning::Load balancer not reachable yet (new LBs can take a few minutes)"

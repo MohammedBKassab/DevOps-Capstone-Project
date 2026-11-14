@@ -1,0 +1,23 @@
+{
+  "name": "task-api",
+  "version": "1.0.0",
+  "description": "Small REST API used for the end-to-end DevOps capstone project",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "prom-client": "^15.1.3"
+  },
+  "devDependencies": {
+    "supertest": "^7.1.0"
+  },
+  "license": "MIT"
+}
