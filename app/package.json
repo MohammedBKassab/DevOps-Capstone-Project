@@ -1,8 +1,7 @@
 {
   "name": "task-api",
   "version": "1.0.0",
-  "description": "Small REST API used for the end-to-end DevOps capstone project",
-  "main": "src/server.js",
+"description": "Small REST API used for the end-to-end DevOps capstone project - CI test",
   "type": "commonjs",
   "scripts": {
     "start": "node src/server.js",
